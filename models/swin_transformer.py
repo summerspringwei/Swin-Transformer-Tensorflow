@@ -24,7 +24,7 @@ class Mlp(Layer):
         self.act = act_layer
         self.fc2 = TruncatedDense(out_features)
         self.drop = Dropout(drop)
-
+    @tf.function(jit_compile=True)
     def call(self, x):
         x = self.fc1(x)
         x = self.act(x)
@@ -33,7 +33,7 @@ class Mlp(Layer):
         x = self.drop(x)
         return x
         
-
+@tf.function(jit_compile=True)
 def window_partition(x, window_size):
     """
     Args:
@@ -50,7 +50,7 @@ def window_partition(x, window_size):
     return windows
 
 
-@tf.function
+@tf.function(jit_compile=True)
 def window_reverse(windows, window_size, H, W):
     """
     Args:
@@ -110,24 +110,45 @@ class WindowAttention(Layer):
         self.proj = TruncatedDense(dim)
         self.proj_drop = Dropout(proj_drop)
         self.softmax = Softmax(axis=-1)
-
-    def call(self, x, mask=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
+    
+    @tf.function(jit_compile=True)
+    def attn_before_softmax(self, x):
         B_, N, C = x.shape
         qkv = tf.transpose(tf.reshape(self.qkv(x), [B_, N, 3, self.num_heads, C // self.num_heads]), perm=[2, 0, 3, 1, 4]) # [3, B_, num_head, Ww*Wh, C//num_head]
         q, k, v = tf.unstack(qkv)  # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
         attn = tf.einsum('...ij,...kj->...ik', q, k)
+        return (attn, v)
+    
+    @tf.function(jit_compile=True)
+    def attn_value(self, attn, v, B_, N, C):
+        x = tf.reshape(tf.transpose(attn @ v, perm=[0, 2, 1, 3]), [B_, N, C])
+        return x
+    
+    # Note, will case xla error if we jit compile the call function
+    def call(self, x, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        # attn, v = self.attn_before_softmax(x)
+        B_, N, C = x.shape
+        attn,v = self.attn_before_softmax(x)
+        # qkv = tf.transpose(tf.reshape(self.qkv(x), [B_, N, 3, self.num_heads, C // self.num_heads]), perm=[2, 0, 3, 1, 4]) # [3, B_, num_head, Ww*Wh, C//num_head]
+        # q, k, v = tf.unstack(qkv)  # make torchscript happy (cannot use tensor as tuple)
 
+        # q = q * self.scale
+        # attn = tf.einsum('...ij,...kj->...ik', q, k)
+
+        # May be here case the xla error
         relative_position_bias = tf.reshape(tf.gather(self.relative_position_bias_table, tf.reshape(self.relative_position_index, -1)),
             [self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1])  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = tf.transpose(relative_position_bias, perm=[2, 0, 1])  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias
+
+        attn = self.softmax(attn)
 
         if mask is not None:
             nW = mask.shape[0] # every window has different mask [nW, N, N]
@@ -139,7 +160,8 @@ class WindowAttention(Layer):
 
         attn = self.attn_drop(attn)
 
-        x = tf.reshape(tf.transpose(attn @ v, perm=[0, 2, 1, 3]), [B_, N, C])
+        x = self.attn_value(attn, v, B_, N, C)
+        # x = tf.reshape(tf.transpose(attn @ v, perm=[0, 2, 1, 3]), [B_, N, C])
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -248,7 +270,9 @@ class SwinTransformerBlock(Layer):
         x_windows = tf.reshape(x_windows, [-1, self.window_size * self.window_size, C])  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
+        # print(self.attn_mask)
         attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        
 
         # merge windows
         attn_windows = tf.reshape(attn_windows, [-1, self.window_size, self.window_size, C])
