@@ -1,5 +1,6 @@
 import argparse
-
+import sys, os
+sys.path.append(str(os.getcwd()))
 import tensorflow as tf
 
 from config import get_config
